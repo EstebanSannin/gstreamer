@@ -69,6 +69,11 @@ struct _GstV4l2Request
   /* bitstream buffer state, set when the request completes */
   guint32 bytesused;
   guint32 flags;
+
+  /* index of the queued picture buffer, -1 if none */
+  gint pic_index;
+  /* the bitstream buffer is queued outside the request */
+  gboolean bitstream_queued;
 };
 
 struct BufState
@@ -901,6 +906,7 @@ gst_v4l2_encoder_queue_sink_buffer (GstV4l2Encoder * self,
 
   buffer_state_queue (self, buf.index,
       gst_dmabuf_memory_get_fd (gst_buffer_peek_memory (buffer, 0)));
+  request->pic_index = buf.index;
 
   return TRUE;
 }
@@ -1204,6 +1210,7 @@ gst_v4l2_encoder_alloc_request (GstV4l2Encoder * self, guint32 frame_num,
   request->bitstream = gst_buffer_ref (bitstream);
   request->pic_buf = gst_buffer_ref (pic_buf);
   request->frame_num = frame_num;
+  request->pic_index = -1;
   request->ref_count = 1;
 
   return request;
@@ -1250,6 +1257,7 @@ gst_v4l2_encoder_alloc_sub_request (GstV4l2Encoder * self,
   request->bitstream = gst_buffer_ref (bitstream);
   request->pic_buf = gst_buffer_ref (prev_request->pic_buf);
   request->frame_num = prev_request->frame_num;
+  request->pic_index = -1;
   request->sub_request = TRUE;
   request->ref_count = 1;
 
@@ -1296,6 +1304,8 @@ gst_v4l2_encoder_request_unref (GstV4l2Request * request)
   request->sub_request = FALSE;
   request->bytesused = 0;
   request->flags = 0;
+  request->pic_index = -1;
+  request->bitstream_queued = FALSE;
 
   if (request->pending) {
     gint idx;
@@ -1324,6 +1334,28 @@ gst_v4l2_encoder_request_unref (GstV4l2Request * request)
   g_clear_object (&request->encoder);
 }
 
+/*
+ * Undo a request that could not be queued: give its picture buffer back, so
+ * that the caller can retry, for instance with a copy of a picture the driver
+ * could not use. The bitstream buffer is not part of the request and stays
+ * queued for the retry. This also drops the controls set on the request.
+ */
+static void
+gst_v4l2_encoder_request_reset (GstV4l2Request * request)
+{
+  GstV4l2Encoder *self = request->encoder;
+
+  if (ioctl (request->fd, MEDIA_REQUEST_IOC_REINIT, NULL) < 0)
+    GST_ERROR_OBJECT (self, "MEDIA_REQUEST_IOC_REINIT failed: %s",
+        g_strerror (errno));
+
+  if (request->pic_index >= 0) {
+    buffer_state_dequeue (self, request->pic_index);
+    self->buffer_state[request->pic_index].dmabuf_fd = -1;
+    request->pic_index = -1;
+  }
+}
+
 gboolean
 gst_v4l2_encoder_request_queue (GstV4l2Request * request, guint flags)
 {
@@ -1344,18 +1376,27 @@ gst_v4l2_encoder_request_queue (GstV4l2Request * request, guint flags)
   if (!gst_v4l2_encoder_queue_sink_buffer (encoder, request,
           request->pic_buf, request->frame_num, flags)) {
     GST_INFO_OBJECT (encoder, "Driver did not accept the picture buffer.");
+    gst_v4l2_encoder_request_reset (request);
     return FALSE;
   }
 
-  if (!gst_v4l2_encoder_queue_src_buffer (encoder, request, request->bitstream)) {
-    GST_ERROR_OBJECT (encoder, "Driver did not accept the bitstream buffer.");
-    return FALSE;
+  if (!request->bitstream_queued) {
+    if (!gst_v4l2_encoder_queue_src_buffer (encoder, request,
+            request->bitstream)) {
+      GST_ERROR_OBJECT (encoder, "Driver did not accept the bitstream buffer.");
+      gst_v4l2_encoder_request_reset (request);
+      return FALSE;
+    }
+    request->bitstream_queued = TRUE;
   }
 
+  /* The picture buffer is validated here, e.g. a DMABuf that is not
+   * contiguous enough for the device fails. */
   ret = ioctl (request->fd, MEDIA_REQUEST_IOC_QUEUE, NULL);
   if (ret < 0) {
-    GST_ERROR_OBJECT (encoder, "MEDIA_REQUEST_IOC_QUEUE, failed: %s",
+    GST_WARNING_OBJECT (encoder, "MEDIA_REQUEST_IOC_QUEUE failed: %s",
         g_strerror (errno));
+    gst_v4l2_encoder_request_reset (request);
     return FALSE;
   }
 

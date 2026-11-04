@@ -122,6 +122,9 @@ struct _GstV4l2CodecH264Enc
    */
   GQueue pending_frames;
   guint max_pending;
+
+  /* Upstream buffers are queued as they are until the driver refuses one */
+  gboolean try_import;
 };
 
 typedef struct
@@ -898,6 +901,7 @@ gst_v4l2_codec_h264_enc_set_format (GstVideoEncoder * encoder,
    * then finish each frame right away so that no latency is added. */
   self->max_pending = gst_v4l2_codec_h264_enc_upstream_is_live (self) ? 0 : 1;
   GST_DEBUG_OBJECT (self, "Up to %u pending frames", self->max_pending);
+  self->try_import = TRUE;
 
   if (!gst_v4l2_encoder_set_src_fmt (self->encoder, &self->vinfo_drm,
           V4L2_PIX_FMT_H264_SLICE)) {
@@ -1108,6 +1112,16 @@ gst_v4l2_codec_h264_enc_pad_rows (GstV4l2CodecH264Enc * self,
   }
 }
 
+/* Whether upstream filled a buffer from the pool we proposed */
+static gboolean
+gst_v4l2_codec_h264_enc_is_pool_buffer (GstV4l2CodecH264Enc * self,
+    GstBuffer * buffer)
+{
+  return gst_buffer_n_memory (buffer) == 1 &&
+      gst_buffer_peek_memory (buffer, 0)->allocator ==
+      GST_ALLOCATOR (self->sink_allocator);
+}
+
 /*
  * Pad buffers that upstream filled from the pool we proposed. The frame holds
  * a reference on the buffer, so map its memory, which is only ours.
@@ -1123,12 +1137,11 @@ gst_v4l2_codec_h264_enc_pad_pool_buffer (GstV4l2CodecH264Enc * self,
   guint plane;
 
   if (self->height >= GST_VIDEO_INFO_HEIGHT (info) ||
-      gst_buffer_n_memory (buffer) != 1)
+      !gst_v4l2_codec_h264_enc_is_pool_buffer (self, buffer))
     return;
 
   mem = gst_buffer_peek_memory (buffer, 0);
-  if (mem->allocator != GST_ALLOCATOR (self->sink_allocator) ||
-      !gst_memory_map (mem, &map, GST_MAP_READWRITE))
+  if (!gst_memory_map (mem, &map, GST_MAP_READWRITE))
     return;
 
   for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES (info); plane++)
@@ -1500,6 +1513,7 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
   GstFlowReturn ret = GST_FLOW_ERROR;
   GstVideoCodecFrame *frame = h264_frame->frame;
   GstV4l2CodecH264EncPending *pending;
+  gboolean own_buffer;
   struct v4l2_ctrl_h264_encode_params encode_params;
 
   struct v4l2_ext_control control[] = {
@@ -1553,7 +1567,20 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
 
   gst_v4l2_codec_h264_enc_pad_pool_buffer (self, frame->input_buffer);
 
-  if (!gst_v4l2_encoder_request_queue (request, 0)) {
+  /*
+   * Queue the picture buffer itself if it is ours, or if the driver did not
+   * refuse an upstream buffer yet (DMABuf it can use), else queue a copy.
+   */
+  own_buffer =
+      gst_v4l2_codec_h264_enc_is_pool_buffer (self, frame->input_buffer);
+  if (!(own_buffer || self->try_import) ||
+      !gst_v4l2_encoder_request_queue (request, 0)) {
+    if (!own_buffer && self->try_import) {
+      GST_INFO_OBJECT (self, "Driver can't use the upstream buffers, "
+          "copying them");
+      self->try_import = FALSE;
+    }
+
     if (!gst_v4l2_codec_h264_enc_copy_input_buffer (self, frame)) {
       GST_ELEMENT_ERROR (self, RESOURCE, NO_SPACE_LEFT,
           ("Failed to allocate/copy input buffer."), (NULL));
@@ -1561,6 +1588,14 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
     }
 
     gst_v4l2_encoder_request_replace_pic_buf (request, frame->input_buffer);
+
+    /* A request that failed to queue lost its controls */
+    if (!gst_v4l2_encoder_set_controls (self->encoder, request, control,
+            G_N_ELEMENTS (control))) {
+      GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+          ("Driver did not accept the control parameters."), (NULL));
+      goto done;
+    }
 
     if (!gst_v4l2_encoder_request_queue (request, 0)) {
       GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
