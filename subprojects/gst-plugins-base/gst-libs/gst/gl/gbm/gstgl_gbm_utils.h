@@ -38,8 +38,6 @@ struct _GstGLDRMFramebuffer
 const gchar* gst_gl_gbm_get_name_for_drm_connector (drmModeConnector * connector);
 const gchar* gst_gl_gbm_get_name_for_drm_encoder (drmModeEncoder * encoder);
 const gchar* gst_gl_gbm_format_to_string (guint32 format);
-int gst_gl_gbm_depth_from_format (guint32 format);
-int gst_gl_gbm_bpp_from_format (guint32 format);
 
 GstGLDRMFramebuffer* gst_gl_gbm_drm_fb_get_from_bo (struct gbm_bo *bo);
 
