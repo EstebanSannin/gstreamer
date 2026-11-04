@@ -648,6 +648,65 @@ out:
   g_free (configs);
 }
 
+#if GST_GL_HAVE_WINDOW_GBM
+/* A GBM window shows its buffers on the primary plane of the display, which
+ * often supports fewer formats than EGL renders to, while EGL sorts configs
+ * with more colour bits (10-bit, alpha) first. Pick the first matching config
+ * whose format the plane can show. */
+static void
+gst_gl_context_egl_choose_gbm_config (GstGLContextEGL * egl,
+    const EGLint * config_attrib)
+{
+  GstGLWindow *window;
+  GstGLDisplayGBM *display_gbm;
+  EGLConfig *configs = NULL;
+  EGLint n_configs = 0, i;
+
+  window = gst_gl_context_get_window (GST_GL_CONTEXT (egl));
+  if (!window)
+    return;
+
+  if (!GST_IS_GL_WINDOW_GBM_EGL (window)
+      || !GST_IS_GL_DISPLAY_GBM (window->display))
+    goto out;
+
+  display_gbm = GST_GL_DISPLAY_GBM (window->display);
+
+  if (!eglChooseConfig (egl->egl_display, config_attrib, NULL, 0, &n_configs)
+      || n_configs <= 0)
+    goto out;
+
+  configs = g_new0 (EGLConfig, n_configs);
+  if (!eglChooseConfig (egl->egl_display, config_attrib, configs, n_configs,
+          &n_configs))
+    goto out;
+
+  for (i = 0; i < n_configs; ++i) {
+    EGLint format;
+
+    if (!eglGetConfigAttrib (egl->egl_display, configs[i],
+            EGL_NATIVE_VISUAL_ID, &format))
+      continue;
+
+    if (gst_gl_display_gbm_get_scanout_format (display_gbm, format) != 0) {
+      if (configs[i] != egl->egl_config)
+        GST_INFO_OBJECT (egl, "Using EGLConfig %d of %d, the first one with "
+            "a format that the display can show (%" GST_FOURCC_FORMAT ")",
+            i + 1, n_configs, GST_FOURCC_ARGS (format));
+      egl->egl_config = configs[i];
+      goto out;
+    }
+  }
+
+  GST_WARNING_OBJECT (egl, "None of the %d matching EGLConfigs has a format "
+      "that the display can show", n_configs);
+
+out:
+  g_free (configs);
+  gst_object_unref (window);
+}
+#endif
+
 static gboolean
 gst_gl_context_egl_choose_config (GstGLContextEGL * egl, GstGLAPI gl_api,
     gint major, GError ** error)
@@ -764,6 +823,10 @@ try_again:
   if (ret && numConfigs == 1) {
     GST_INFO ("config set: %" G_GUINTPTR_FORMAT ", %u",
         (guintptr) egl->egl_config, (unsigned int) numConfigs);
+#if GST_GL_HAVE_WINDOW_GBM
+    if (surface_type == EGL_WINDOW_BIT)
+      gst_gl_context_egl_choose_gbm_config (egl, config_attrib);
+#endif
   } else {
     if (!ret) {
       g_set_error (error, GST_GL_CONTEXT_ERROR,

@@ -57,6 +57,10 @@ struct _GstGLDisplayGBM
   int crtc_index;
   guint32 crtc_id;
 
+  /* Formats of the primary plane of the CRTC, NULL if unknown */
+  guint32 *plane_formats;
+  guint n_plane_formats;
+
   struct gbm_device *gbm_dev;
 
   gpointer _reserved[GST_PADDING];
@@ -71,6 +75,9 @@ struct _GstGLDisplayGBMClass
 };
 
 GstGLDisplayGBM *gst_gl_display_gbm_new (void);
+
+guint32 gst_gl_display_gbm_get_scanout_format (GstGLDisplayGBM * display_gbm,
+    guint32 format);
 
 G_END_DECLS
 

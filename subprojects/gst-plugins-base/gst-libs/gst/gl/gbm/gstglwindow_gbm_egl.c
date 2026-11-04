@@ -354,6 +354,7 @@ gst_gl_window_gbm_init_surface (GstGLWindowGBMEGL * window_egl)
   GstGLContext *context = gst_gl_window_get_context (window);
   GstGLContextEGL *context_egl = GST_GL_CONTEXT_EGL (context);
   EGLint gbm_format;
+  guint32 scanout_format;
   int hdisplay, vdisplay;
   gboolean ret = TRUE;
 
@@ -373,6 +374,15 @@ gst_gl_window_gbm_init_surface (GstGLWindowGBMEGL * window_egl)
         gst_egl_get_error_string (eglGetError ()));
     ret = FALSE;
     goto cleanup;
+  }
+
+  /* The display may only show the format of the EGLConfig without alpha */
+  scanout_format = gst_gl_display_gbm_get_scanout_format (display, gbm_format);
+  if (scanout_format != 0 && scanout_format != (guint32) gbm_format) {
+    GST_DEBUG ("Using GBM format %s for an EGLConfig with format %s",
+        gst_gl_gbm_format_to_string (scanout_format),
+        gst_gl_gbm_format_to_string (gbm_format));
+    gbm_format = scanout_format;
   }
 
   /* Create a GBM surface that shall contain the BOs we are
