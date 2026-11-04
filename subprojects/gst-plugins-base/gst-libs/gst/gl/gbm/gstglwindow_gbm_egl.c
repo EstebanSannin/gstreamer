@@ -220,6 +220,15 @@ draw_cb (gpointer data)
         gbm_surface_lock_front_buffer (window_egl->gbm_surf);
     framebuf = gst_gl_gbm_drm_fb_get_from_bo (window_egl->current_bo);
 
+    if (framebuf == NULL) {
+      GST_ERROR ("Could not get a DRM framebuffer for the first frame");
+      gbm_surface_release_buffer (window_egl->gbm_surf, window_egl->current_bo);
+      window_egl->current_bo = NULL;
+      gst_object_unref (context);
+      /* XXX: it is not possible to communicate the error to the pipeline */
+      return;
+    }
+
     /* Save the CRTC state */
     if (!window_egl->saved_crtc)
       window_egl->saved_crtc =
@@ -257,6 +266,12 @@ draw_cb (gpointer data)
 
   next_bo = gbm_surface_lock_front_buffer (window_egl->gbm_surf);
   framebuf = gst_gl_gbm_drm_fb_get_from_bo (next_bo);
+  if (framebuf == NULL) {
+    GST_ERROR ("Could not get a DRM framebuffer for bo %p", (gpointer) next_bo);
+    gbm_surface_release_buffer (window_egl->gbm_surf, next_bo);
+    /* XXX: it is not possible to communicate the error to the pipeline */
+    return;
+  }
   GST_LOG ("rendered new frame into bo %p", (gpointer) next_bo);
 
   /* Wait until any ongoing page flipping is done. After this is done,
