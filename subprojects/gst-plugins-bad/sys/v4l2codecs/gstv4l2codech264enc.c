@@ -715,6 +715,9 @@ gst_v4l2_codec_h264_enc_init_pps (GstV4l2CodecH264Enc * self,
 
   /* The driver must support CABAC entropy encoding mode, if this is enabled. */
   pps->entropy_coding_mode_flag = self->cabac;
+
+  /* The 8x8 transform is what High profile adds for 4:2:0 8-bit content. */
+  pps->transform_8x8_mode_flag = g_str_equal (self->profile_name, "high");
 }
 
 /* Begin of code taken from VA plugin */
