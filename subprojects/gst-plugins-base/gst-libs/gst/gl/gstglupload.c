@@ -4169,6 +4169,34 @@ restart:
 #undef NEXT_METHOD
 }
 
+/* Restricts @othercaps to the caps that @method produces from @caps. Returns
+ * FALSE and leaves @othercaps unchanged if they have none in common. */
+static gboolean
+_restrict_to_method_caps (GstGLUpload * upload, const UploadMethod * method,
+    gpointer impl, GstCaps * caps, GstCaps ** othercaps)
+{
+  GstCaps *method_caps, *tmp;
+
+  method_caps = method->transform_caps (impl, upload->context, GST_PAD_SINK,
+      caps);
+  if (!method_caps)
+    return FALSE;
+
+  tmp = gst_caps_intersect_full (method_caps, *othercaps,
+      GST_CAPS_INTERSECT_FIRST);
+  gst_caps_unref (method_caps);
+
+  if (gst_caps_is_empty (tmp)) {
+    gst_caps_unref (tmp);
+    return FALSE;
+  }
+
+  gst_caps_unref (*othercaps);
+  *othercaps = tmp;
+
+  return TRUE;
+}
+
 /**
  * gst_gl_upload_fixate_caps:
  * @upload: a #GstGLUpload
@@ -4208,23 +4236,26 @@ gst_gl_upload_fixate_caps (GstGLUpload * upload, GstPadDirection direction,
   // if possible.
   GST_OBJECT_LOCK (upload);
   if (upload->priv->method) {
-    GstCaps *current_method_caps =
-        upload->priv->method->transform_caps (upload->priv->method_impl,
-        upload->context, GST_PAD_SINK, caps);
-    if (!current_method_caps)
-      goto done;
-    GstCaps *tmp = gst_caps_intersect_full (current_method_caps, othercaps,
-        GST_CAPS_INTERSECT_FIRST);
-
-    if (!gst_caps_is_empty (tmp)) {
-      gst_caps_unref (othercaps);
-      othercaps = tmp;
-    } else {
-      gst_caps_unref (tmp);
+    _restrict_to_method_caps (upload, upload->priv->method,
+        upload->priv->method_impl, caps, &othercaps);
+  } else if (upload->context && !gst_caps_is_empty (caps)
+      && gst_caps_features_contains (gst_caps_get_features (caps, 0),
+          GST_CAPS_FEATURE_MEMORY_DMABUF)) {
+    // Otherwise, for DMABuf input, fixate to the caps of the first method in
+    // order of preference that can take it, as that is the method that will
+    // be used. Each DMABuf method produces only its own texture target, so
+    // the 2D preference below would pick the per-plane import over a direct
+    // import into an external texture, which is the only direct import of
+    // some formats (linear NV12 on etnaviv, for example).
+    for (i = 0; i < G_N_ELEMENTS (upload_methods); i++) {
+      if (_restrict_to_method_caps (upload, upload_methods[i],
+              upload->priv->upload_impl[i], caps, &othercaps)) {
+        GST_DEBUG_OBJECT (upload, "fixating to the caps of uploader %s",
+            upload_methods[i]->name);
+        break;
+      }
     }
-    gst_caps_unref (current_method_caps);
   }
-done:
   GST_OBJECT_UNLOCK (upload);
 
   /* Prefer target 2D->rectangle->oes */
