@@ -435,12 +435,56 @@ gst_gl_gbm_drm_fb_get_from_bo (struct gbm_bo *bo)
 }
 
 
+typedef enum
+{
+  DRM_DISPLAY_NONE,
+  DRM_DISPLAY_DISCONNECTED,
+  DRM_DISPLAY_CONNECTED,
+} DRMDisplayState;
+
+static DRMDisplayState
+gst_gl_gbm_get_drm_display_state (int drm_fd)
+{
+  DRMDisplayState state = DRM_DISPLAY_NONE;
+  drmModeRes *resources;
+  int i;
+
+  /* Render-only devices have no mode setting resources */
+  resources = drmModeGetResources (drm_fd);
+  if (resources == NULL)
+    return DRM_DISPLAY_NONE;
+
+  for (i = 0; i < resources->count_connectors; ++i) {
+    drmModeConnector *connector =
+        drmModeGetConnector (drm_fd, resources->connectors[i]);
+
+    if (connector == NULL)
+      continue;
+
+    if (connector->connection == DRM_MODE_CONNECTED)
+      state = DRM_DISPLAY_CONNECTED;
+    else if (state == DRM_DISPLAY_NONE)
+      state = DRM_DISPLAY_DISCONNECTED;
+
+    drmModeFreeConnector (connector);
+
+    if (state == DRM_DISPLAY_CONNECTED)
+      break;
+  }
+
+  drmModeFreeResources (resources);
+
+  return state;
+}
+
+
 int
 gst_gl_gbm_find_and_open_drm_node (void)
 {
   /* In here we use GUDev to try to autodetect the GPU */
 
-  int drm_fd = -1;
+  int drm_fd = -1, fd;
+  DRMDisplayState display, best_display = DRM_DISPLAY_NONE;
   GUdevClient *gudev_client = NULL;
   GUdevEnumerator *gudev_enum = NULL;
   GList *devlist = NULL;
@@ -461,10 +505,12 @@ gst_gl_gbm_find_and_open_drm_node (void)
   }
   GST_DEBUG ("Created gudev enumerator");
 
-  /* TODO: To be 100% sure we pick the right device, also check
-   * if this is a GPU, because a pure scanout device could also
-   * have a DRM subsystem for example. However, currently it is
-   * unclear how to do that. By trying to create an EGL context? */
+  /* Prefer a device with a connected display. On many SoCs the GPU is a
+   * render-only DRM device next to the display controller (etnaviv and
+   * the LCDIF on i.MX, for example), and the GPU may come first. Mesa
+   * renders into buffers of the display controller through its kmsro
+   * driver. Without any display, fall back to the first device that can
+   * be opened, so that rendering without a display keeps working. */
   g_udev_enumerator_add_match_subsystem (gudev_enum, "drm");
   devlist = g_udev_enumerator_execute (gudev_enum);
   GST_DEBUG ("Scanned for udev devices with a drm subsystem");
@@ -484,15 +530,30 @@ gst_gl_gbm_find_and_open_drm_node (void)
 
     GST_DEBUG ("Found DRM device with device node \"%s\"", devnode);
 
-    drm_fd = open (devnode, O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) {
+    fd = open (devnode, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
       GST_WARNING ("Cannot open device node \"%s\": %s (%d)", devnode,
           g_strerror (errno), errno);
       continue;
     }
 
-    GST_DEBUG ("Device node \"%s\" is a valid DRM device node", devnode);
-    break;
+    display = gst_gl_gbm_get_drm_display_state (fd);
+    GST_DEBUG ("Device node \"%s\" is a valid DRM device node (%s)", devnode,
+        display == DRM_DISPLAY_CONNECTED ? "display connected" :
+        display == DRM_DISPLAY_DISCONNECTED ? "no display connected" :
+        "no display connectors");
+
+    if (drm_fd < 0 || display > best_display) {
+      if (drm_fd >= 0)
+        close (drm_fd);
+      drm_fd = fd;
+      best_display = display;
+    } else {
+      close (fd);
+    }
+
+    if (best_display == DRM_DISPLAY_CONNECTED)
+      break;
   }
 
 
