@@ -289,6 +289,11 @@ gst_v4l2_codec_h264_enc_propose_allocation (GstVideoEncoder * encoder,
       self->vinfo_drm.vinfo.size, 2, 0);
   gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
 
+  /* The query holds its own reference. Keeping ours would keep the sink
+   * allocator, and so its buffers, alive forever. */
+  if (pool)
+    gst_object_unref (pool);
+
   return GST_VIDEO_ENCODER_CLASS (parent_class)->propose_allocation (encoder,
       query);
 }
