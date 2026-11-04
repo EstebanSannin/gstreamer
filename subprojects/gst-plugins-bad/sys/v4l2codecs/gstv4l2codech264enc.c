@@ -1080,6 +1080,64 @@ gst_v4l2_codec_h264_enc_get_property (GObject * object, guint prop_id,
   }
 }
 
+/*
+ * The hardware encodes whole macroblocks, so it also reads the rows below the
+ * picture down to the coded height. Fill them with the last row of the
+ * picture: stale data there costs several KB per 1080p frame for nothing.
+ */
+static void
+gst_v4l2_codec_h264_enc_pad_rows (GstV4l2CodecH264Enc * self,
+    const GstVideoInfo * info, guint8 * planes[GST_VIDEO_MAX_PLANES])
+{
+  const GstVideoFormatInfo *finfo = info->finfo;
+  guint plane;
+
+  for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES (info); plane++) {
+    gint comp[GST_VIDEO_MAX_COMPONENTS];
+    guint8 *data = planes[plane];
+    gint stride = GST_VIDEO_INFO_PLANE_STRIDE (info, plane);
+    gint visible, rows, row;
+
+    gst_video_format_info_component (finfo, plane, comp);
+    visible = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (finfo, comp[0], self->height);
+    rows = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (finfo, comp[0],
+        GST_VIDEO_INFO_HEIGHT (info));
+
+    for (row = visible; row < rows; row++)
+      memcpy (data + row * stride, data + (row - 1) * stride, stride);
+  }
+}
+
+/*
+ * Pad buffers that upstream filled from the pool we proposed. The frame holds
+ * a reference on the buffer, so map its memory, which is only ours.
+ */
+static void
+gst_v4l2_codec_h264_enc_pad_pool_buffer (GstV4l2CodecH264Enc * self,
+    GstBuffer * buffer)
+{
+  const GstVideoInfo *info = &self->vinfo_drm.vinfo;
+  guint8 *planes[GST_VIDEO_MAX_PLANES];
+  GstMemory *mem;
+  GstMapInfo map;
+  guint plane;
+
+  if (self->height >= GST_VIDEO_INFO_HEIGHT (info) ||
+      gst_buffer_n_memory (buffer) != 1)
+    return;
+
+  mem = gst_buffer_peek_memory (buffer, 0);
+  if (mem->allocator != GST_ALLOCATOR (self->sink_allocator) ||
+      !gst_memory_map (mem, &map, GST_MAP_READWRITE))
+    return;
+
+  for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES (info); plane++)
+    planes[plane] = map.data + GST_VIDEO_INFO_PLANE_OFFSET (info, plane);
+
+  gst_v4l2_codec_h264_enc_pad_rows (self, info, planes);
+  gst_memory_unmap (mem, &map);
+}
+
 static gboolean
 gst_v4l2_codec_h264_enc_copy_input_buffer (GstV4l2CodecH264Enc * self,
     GstVideoCodecFrame * frame)
@@ -1123,6 +1181,9 @@ gst_v4l2_codec_h264_enc_copy_input_buffer (GstV4l2CodecH264Enc * self,
     gst_video_frame_unmap (&dest_frame);
     goto fail;
   }
+
+  gst_v4l2_codec_h264_enc_pad_rows (self, &dest_frame.info,
+      (guint8 **) dest_frame.data);
 
   gst_video_frame_unmap (&src_frame);
   gst_video_frame_unmap (&dest_frame);
@@ -1489,6 +1550,8 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
         ("Driver did not accept the control parameters."), (NULL));
     goto done;
   }
+
+  gst_v4l2_codec_h264_enc_pad_pool_buffer (self, frame->input_buffer);
 
   if (!gst_v4l2_encoder_request_queue (request, 0)) {
     if (!gst_v4l2_codec_h264_enc_copy_input_buffer (self, frame)) {
