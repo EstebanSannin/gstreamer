@@ -65,6 +65,10 @@ struct _GstV4l2Request
   gboolean failed;
   gboolean hold_pic_buf;
   gboolean sub_request;
+
+  /* bitstream buffer state, set when the request completes */
+  guint32 bytesused;
+  guint32 flags;
 };
 
 struct BufState
@@ -1290,6 +1294,8 @@ gst_v4l2_encoder_request_unref (GstV4l2Request * request)
   request->failed = FALSE;
   request->hold_pic_buf = FALSE;
   request->sub_request = FALSE;
+  request->bytesused = 0;
+  request->flags = 0;
 
   if (request->pending) {
     gint idx;
@@ -1356,16 +1362,11 @@ gst_v4l2_encoder_request_queue (GstV4l2Request * request, guint flags)
   if (flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)
     request->hold_pic_buf = TRUE;
 
+  /* Several requests may be pending, the element decides how many and
+   * completes them in order with gst_v4l2_encoder_request_set_done(). */
   request->pending = TRUE;
   gst_queue_array_push_tail (encoder->pending_requests,
       gst_v4l2_encoder_request_ref (request));
-
-  if (gst_queue_array_get_length (encoder->pending_requests) > 1) {
-    GstV4l2Request *pending_req;
-
-    pending_req = gst_queue_array_peek_head (encoder->pending_requests);
-    gst_v4l2_request_set_done (pending_req);
-  }
 
   return TRUE;
 }
@@ -1378,9 +1379,14 @@ gst_v4l2_encoder_request_set_done (GstV4l2Request * request,
   GstV4l2Request *pending_req = NULL;
   gint ret;
 
-  *bytesused = 0;
-  if (!request->pending)
+  /* Already completed while waiting for a later request */
+  if (!request->pending) {
+    *bytesused = request->bytesused;
+    *flags = request->flags;
     return 1;
+  }
+
+  *bytesused = 0;
 
   GST_DEBUG_OBJECT (encoder, "Waiting for request %i to complete.",
       request->fd);
@@ -1402,7 +1408,8 @@ gst_v4l2_encoder_request_set_done (GstV4l2Request * request,
 
     if (!pending_req->hold_pic_buf) {
       guint32 frame_num = G_MAXUINT32;
-      if (!gst_v4l2_encoder_dequeue_src (encoder, &frame_num, bytesused, flags)) {
+      if (!gst_v4l2_encoder_dequeue_src (encoder, &frame_num,
+              &pending_req->bytesused, &pending_req->flags)) {
         pending_req->failed = TRUE;
       } else if (frame_num != pending_req->frame_num) {
         GST_WARNING_OBJECT (encoder,
@@ -1421,6 +1428,9 @@ gst_v4l2_encoder_request_set_done (GstV4l2Request * request,
 
   /* Pending request must be in the pending request list */
   g_assert (pending_req == request);
+
+  *bytesused = request->bytesused;
+  *flags = request->flags;
 
   return ret;
 }
