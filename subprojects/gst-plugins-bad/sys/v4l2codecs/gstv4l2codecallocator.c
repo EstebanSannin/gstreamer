@@ -185,7 +185,7 @@ gst_v4l2_codec_allocator_release (GstMiniObject * mini_object)
 {
   GstMemory *mem = GST_MEMORY_CAST (mini_object);
   GstV4l2CodecAllocator *self = GST_V4L2_CODEC_ALLOCATOR (mem->allocator);
-  GstV4l2CodecBuffer *buf;
+  GstV4l2CodecBuffer *buf, *free_buf = NULL;
 
   GST_OBJECT_LOCK (self);
 
@@ -193,15 +193,24 @@ gst_v4l2_codec_allocator_release (GstMiniObject * mini_object)
   gst_memory_ref (mem);
 
   if (gst_v4l2_codec_buffer_release_mem (buf)) {
-    GST_DEBUG_OBJECT (self, "Placing back buffer %i into pool", buf->index);
-    g_queue_push_tail (&self->pool, buf);
-    g_cond_signal (&self->buffer_cond);
+    if (self->detached) {
+      /* The queue is gone, close the DMABuf so the kernel can free it. */
+      free_buf = buf;
+    } else {
+      GST_DEBUG_OBJECT (self, "Placing back buffer %i into pool", buf->index);
+      g_queue_push_tail (&self->pool, buf);
+      g_cond_signal (&self->buffer_cond);
+    }
   }
 
   GST_OBJECT_UNLOCK (self);
 
-  /* Keep last in case we are holding on the last allocator ref */
-  g_object_unref (mem->allocator);
+  if (free_buf)
+    gst_v4l2_codec_buffer_free (free_buf);
+
+  /* Keep last in case we are holding on the last allocator ref. The memory
+   * may be gone already, self is its allocator. */
+  g_object_unref (self);
 
   /* Returns FALSE so that our mini object isn't freed */
   return FALSE;
@@ -277,8 +286,11 @@ gst_v4l2_codec_encoder_allocator_prepare (GstV4l2CodecAllocator * self)
     g_queue_push_tail (&self->pool, buf);
   }
 
+  /* The picture buffers are queued as DMABuf, the same way as buffers from
+   * upstream. Release the MMAP buffers from the queue but not from the pool:
+   * the exported DMABuf keep them alive. */
   if (direction == GST_PAD_SINK) {
-    gst_v4l2_codec_allocator_detach (self);
+    gst_v4l2_encoder_request_buffers (encoder, direction, 0, V4L2_MEMORY_MMAP);
     gst_v4l2_encoder_request_buffers (encoder, direction,
         VIDEO_MAX_FRAME, V4L2_MEMORY_DMABUF);
   }
@@ -416,9 +428,10 @@ gst_v4l2_codec_allocator_wait_for_buffer (GstV4l2CodecAllocator * self)
   gboolean ret;
 
   GST_OBJECT_LOCK (self);
-  while (self->pool.length == 0 && !self->flushing)
+  /* A detached allocator gets no buffer back, don't wait for one. */
+  while (self->pool.length == 0 && !self->flushing && !self->detached)
     g_cond_wait (&self->buffer_cond, GST_OBJECT_GET_LOCK (self));
-  ret = !self->flushing;
+  ret = !self->flushing && !self->detached;
   GST_OBJECT_UNLOCK (self);
 
   return ret;
@@ -474,6 +487,7 @@ gst_v4l2_codec_allocator_detach (GstV4l2CodecAllocator * self)
   if (!self->detached) {
     GstV4l2CodecBuffer *buf;
     self->detached = TRUE;
+    g_cond_broadcast (&self->buffer_cond);
     if (decoder) {
       if (!gst_v4l2_decoder_has_remove_bufs (decoder)) {
         gst_v4l2_decoder_request_buffers (decoder, self->direction, 0);

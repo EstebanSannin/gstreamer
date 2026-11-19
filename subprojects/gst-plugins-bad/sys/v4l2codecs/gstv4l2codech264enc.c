@@ -114,12 +114,126 @@ struct _GstV4l2CodecH264Enc
    */
   guint16 frame_num;
   guint16 poc;
+
+  /*
+   * Frames queued to the driver but not finished yet, oldest first. Keeping
+   * one pending lets the hardware encode a frame while the next one is being
+   * prepared (input copy).
+   */
+  GQueue pending_frames;
+  guint max_pending;
+
+  /* Upstream buffers are queued as they are until the driver refuses one */
+  gboolean try_import;
 };
+
+typedef struct
+{
+  GstV4l2Request *request;
+  /* the reference passed to handle_frame(), given to finish_frame() */
+  GstVideoCodecFrame *frame;
+  gboolean keyframe;
+} GstV4l2CodecH264EncPending;
 
 G_DEFINE_ABSTRACT_TYPE (GstV4l2CodecH264Enc, gst_v4l2_codec_h264_enc,
     GST_TYPE_H264_ENCODER);
 
 #define parent_class gst_v4l2_codec_h264_enc_parent_class
+
+static void
+gst_v4l2_codec_h264_enc_pending_free (GstV4l2CodecH264EncPending * pending)
+{
+  gst_v4l2_encoder_request_unref (pending->request);
+  gst_video_codec_frame_unref (pending->frame);
+  g_free (pending);
+}
+
+/* Wait for the oldest pending frame to be encoded and push it downstream. */
+static GstFlowReturn
+gst_v4l2_codec_h264_enc_finish_pending (GstV4l2CodecH264Enc * self)
+{
+  GstV4l2CodecH264EncPending *pending;
+  GstVideoCodecFrame *frame;
+  GstBuffer *resized_buffer;
+  gboolean keyframe;
+  guint32 bytesused;
+  guint32 flags;
+
+  pending = g_queue_pop_head (&self->pending_frames);
+  if (!pending)
+    return GST_FLOW_OK;
+
+  if (!gst_v4l2_encoder_request_set_done (pending->request, &bytesused,
+          &flags)) {
+    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+        ("Driver did not ack the request."), (NULL));
+    gst_v4l2_codec_h264_enc_pending_free (pending);
+    return GST_FLOW_ERROR;
+  }
+
+  frame = pending->frame;
+  keyframe = pending->keyframe;
+  gst_v4l2_encoder_request_unref (pending->request);
+  g_free (pending);
+
+  resized_buffer = gst_buffer_copy_region (frame->output_buffer,
+      GST_BUFFER_COPY_MEMORY | GST_BUFFER_COPY_DEEP, 0, bytesused);
+  gst_buffer_replace (&frame->output_buffer, resized_buffer);
+  gst_buffer_unref (resized_buffer);
+
+  if (keyframe) {
+    GST_BUFFER_FLAG_UNSET (frame->output_buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+    GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
+  } else {
+    GST_BUFFER_FLAG_SET (frame->output_buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+    GST_VIDEO_CODEC_FRAME_UNSET_SYNC_POINT (frame);
+  }
+
+  return gst_video_encoder_finish_frame (GST_VIDEO_ENCODER (self), frame);
+}
+
+static GstFlowReturn
+gst_v4l2_codec_h264_enc_drain_pending (GstV4l2CodecH264Enc * self)
+{
+  GstFlowReturn ret = GST_FLOW_OK;
+
+  while (!g_queue_is_empty (&self->pending_frames)) {
+    GstFlowReturn flow_ret = gst_v4l2_codec_h264_enc_finish_pending (self);
+
+    if (ret == GST_FLOW_OK)
+      ret = flow_ret;
+  }
+
+  return ret;
+}
+
+/* Drop the pending frames, after the queues were stopped. */
+static void
+gst_v4l2_codec_h264_enc_clear_pending (GstV4l2CodecH264Enc * self)
+{
+  g_queue_clear_full (&self->pending_frames,
+      (GDestroyNotify) gst_v4l2_codec_h264_enc_pending_free);
+}
+
+/*
+ * Whether upstream is live. Sources may not answer the latency query yet when
+ * the caps arrive (v4l2src does not before its framerate is set): assume live
+ * then, which only costs throughput.
+ */
+static gboolean
+gst_v4l2_codec_h264_enc_upstream_is_live (GstV4l2CodecH264Enc * self)
+{
+  GstQuery *query = gst_query_new_latency ();
+  gboolean live = TRUE;
+
+  if (gst_pad_peer_query (GST_VIDEO_ENCODER_SINK_PAD (self), query))
+    gst_query_parse_latency (query, &live, NULL, NULL);
+  else
+    GST_DEBUG_OBJECT (self, "Latency query failed, assuming live upstream");
+  gst_query_unref (query);
+
+  return live;
+}
 
 static gboolean
 gst_v4l2_codec_h264_enc_open (GstVideoEncoder * encoder)
@@ -241,6 +355,7 @@ gst_v4l2_codec_h264_enc_stop (GstVideoEncoder * encoder)
 
   gst_v4l2_encoder_streamoff (self->encoder, GST_PAD_SINK);
   gst_v4l2_encoder_streamoff (self->encoder, GST_PAD_SRC);
+  gst_v4l2_codec_h264_enc_clear_pending (self);
 
   gst_v4l2_codec_h264_enc_reset_allocation (self);
 
@@ -288,6 +403,11 @@ gst_v4l2_codec_h264_enc_propose_allocation (GstVideoEncoder * encoder,
   gst_query_add_allocation_pool (query, GST_BUFFER_POOL (pool),
       self->vinfo_drm.vinfo.size, 2, 0);
   gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+
+  /* The query holds its own reference. Keeping ours would keep the sink
+   * allocator, and so its buffers, alive forever. */
+  if (pool)
+    gst_object_unref (pool);
 
   return GST_VIDEO_ENCODER_CLASS (parent_class)->propose_allocation (encoder,
       query);
@@ -598,6 +718,9 @@ gst_v4l2_codec_h264_enc_init_pps (GstV4l2CodecH264Enc * self,
 
   /* The driver must support CABAC entropy encoding mode, if this is enabled. */
   pps->entropy_coding_mode_flag = self->cabac;
+
+  /* The 8x8 transform is what High profile adds for 4:2:0 8-bit content. */
+  pps->transform_8x8_mode_flag = g_str_equal (self->profile_name, "high");
 }
 
 /* Begin of code taken from VA plugin */
@@ -766,10 +889,19 @@ gst_v4l2_codec_h264_enc_set_format (GstVideoEncoder * encoder,
   GstV4l2CodecH264Enc *self = GST_V4L2_CODEC_H264_ENC (encoder);
   GstCaps *caps;
 
+  /* Frames encoded with the previous format go out first */
+  gst_v4l2_codec_h264_enc_drain_pending (self);
+
   gst_v4l2_encoder_streamoff (self->encoder, GST_PAD_SINK);
   gst_v4l2_encoder_streamoff (self->encoder, GST_PAD_SRC);
 
   gst_v4l2_codec_h264_enc_reset_allocation (self);
+
+  /* Encode a frame while the next one is prepared, unless upstream is live:
+   * then finish each frame right away so that no latency is added. */
+  self->max_pending = gst_v4l2_codec_h264_enc_upstream_is_live (self) ? 0 : 1;
+  GST_DEBUG_OBJECT (self, "Up to %u pending frames", self->max_pending);
+  self->try_import = TRUE;
 
   if (!gst_v4l2_encoder_set_src_fmt (self->encoder, &self->vinfo_drm,
           V4L2_PIX_FMT_H264_SLICE)) {
@@ -881,9 +1013,18 @@ gst_v4l2_codec_h264_enc_flush (GstVideoEncoder * encoder)
   GST_DEBUG_OBJECT (self, "Flushing encoder state.");
 
   gst_v4l2_encoder_flush (self->encoder);
+  gst_v4l2_codec_h264_enc_clear_pending (self);
   gst_v4l2_codec_h264_enc_set_flushing (self, FALSE);
 
   return GST_VIDEO_ENCODER_CLASS (parent_class)->flush (encoder);
+}
+
+static GstFlowReturn
+gst_v4l2_codec_h264_enc_finish (GstVideoEncoder * encoder)
+{
+  GstV4l2CodecH264Enc *self = GST_V4L2_CODEC_H264_ENC (encoder);
+
+  return gst_v4l2_codec_h264_enc_drain_pending (self);
 }
 
 static gboolean
@@ -943,6 +1084,73 @@ gst_v4l2_codec_h264_enc_get_property (GObject * object, guint prop_id,
   }
 }
 
+/*
+ * The hardware encodes whole macroblocks, so it also reads the rows below the
+ * picture down to the coded height. Fill them with the last row of the
+ * picture: stale data there costs several KB per 1080p frame for nothing.
+ */
+static void
+gst_v4l2_codec_h264_enc_pad_rows (GstV4l2CodecH264Enc * self,
+    const GstVideoInfo * info, guint8 * planes[GST_VIDEO_MAX_PLANES])
+{
+  const GstVideoFormatInfo *finfo = info->finfo;
+  guint plane;
+
+  for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES (info); plane++) {
+    gint comp[GST_VIDEO_MAX_COMPONENTS];
+    guint8 *data = planes[plane];
+    gint stride = GST_VIDEO_INFO_PLANE_STRIDE (info, plane);
+    gint visible, rows, row;
+
+    gst_video_format_info_component (finfo, plane, comp);
+    visible = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (finfo, comp[0], self->height);
+    rows = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (finfo, comp[0],
+        GST_VIDEO_INFO_HEIGHT (info));
+
+    for (row = visible; row < rows; row++)
+      memcpy (data + row * stride, data + (row - 1) * stride, stride);
+  }
+}
+
+/* Whether upstream filled a buffer from the pool we proposed */
+static gboolean
+gst_v4l2_codec_h264_enc_is_pool_buffer (GstV4l2CodecH264Enc * self,
+    GstBuffer * buffer)
+{
+  return gst_buffer_n_memory (buffer) == 1 &&
+      gst_buffer_peek_memory (buffer, 0)->allocator ==
+      GST_ALLOCATOR (self->sink_allocator);
+}
+
+/*
+ * Pad buffers that upstream filled from the pool we proposed. The frame holds
+ * a reference on the buffer, so map its memory, which is only ours.
+ */
+static void
+gst_v4l2_codec_h264_enc_pad_pool_buffer (GstV4l2CodecH264Enc * self,
+    GstBuffer * buffer)
+{
+  const GstVideoInfo *info = &self->vinfo_drm.vinfo;
+  guint8 *planes[GST_VIDEO_MAX_PLANES];
+  GstMemory *mem;
+  GstMapInfo map;
+  guint plane;
+
+  if (self->height >= GST_VIDEO_INFO_HEIGHT (info) ||
+      !gst_v4l2_codec_h264_enc_is_pool_buffer (self, buffer))
+    return;
+
+  mem = gst_buffer_peek_memory (buffer, 0);
+  if (!gst_memory_map (mem, &map, GST_MAP_READWRITE))
+    return;
+
+  for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES (info); plane++)
+    planes[plane] = map.data + GST_VIDEO_INFO_PLANE_OFFSET (info, plane);
+
+  gst_v4l2_codec_h264_enc_pad_rows (self, info, planes);
+  gst_memory_unmap (mem, &map);
+}
+
 static gboolean
 gst_v4l2_codec_h264_enc_copy_input_buffer (GstV4l2CodecH264Enc * self,
     GstVideoCodecFrame * frame)
@@ -986,6 +1194,9 @@ gst_v4l2_codec_h264_enc_copy_input_buffer (GstV4l2CodecH264Enc * self,
     gst_video_frame_unmap (&dest_frame);
     goto fail;
   }
+
+  gst_v4l2_codec_h264_enc_pad_rows (self, &dest_frame.info,
+      (guint8 **) dest_frame.data);
 
   gst_video_frame_unmap (&src_frame);
   gst_video_frame_unmap (&dest_frame);
@@ -1298,13 +1509,11 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
     GstH264Frame * h264_frame)
 {
   GstV4l2CodecH264Enc *self = GST_V4L2_CODEC_H264_ENC (encoder);
-  GstVideoEncoder *venc = GST_VIDEO_ENCODER (encoder);
   GstV4l2Request *request = NULL;
   GstFlowReturn ret = GST_FLOW_ERROR;
   GstVideoCodecFrame *frame = h264_frame->frame;
-  GstBuffer *resized_buffer;
-  guint32 bytesused;
-  guint32 flags;
+  GstV4l2CodecH264EncPending *pending;
+  gboolean own_buffer;
   struct v4l2_ctrl_h264_encode_params encode_params;
 
   struct v4l2_ext_control control[] = {
@@ -1356,7 +1565,22 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
     goto done;
   }
 
-  if (!gst_v4l2_encoder_request_queue (request, 0)) {
+  gst_v4l2_codec_h264_enc_pad_pool_buffer (self, frame->input_buffer);
+
+  /*
+   * Queue the picture buffer itself if it is ours, or if the driver did not
+   * refuse an upstream buffer yet (DMABuf it can use), else queue a copy.
+   */
+  own_buffer =
+      gst_v4l2_codec_h264_enc_is_pool_buffer (self, frame->input_buffer);
+  if (!(own_buffer || self->try_import) ||
+      !gst_v4l2_encoder_request_queue (request, 0)) {
+    if (!own_buffer && self->try_import) {
+      GST_INFO_OBJECT (self, "Driver can't use the upstream buffers, "
+          "copying them");
+      self->try_import = FALSE;
+    }
+
     if (!gst_v4l2_codec_h264_enc_copy_input_buffer (self, frame)) {
       GST_ELEMENT_ERROR (self, RESOURCE, NO_SPACE_LEFT,
           ("Failed to allocate/copy input buffer."), (NULL));
@@ -1365,6 +1589,14 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
 
     gst_v4l2_encoder_request_replace_pic_buf (request, frame->input_buffer);
 
+    /* A request that failed to queue lost its controls */
+    if (!gst_v4l2_encoder_set_controls (self->encoder, request, control,
+            G_N_ELEMENTS (control))) {
+      GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+          ("Driver did not accept the control parameters."), (NULL));
+      goto done;
+    }
+
     if (!gst_v4l2_encoder_request_queue (request, 0)) {
       GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
           ("Driver did not accept the encode request."), (NULL));
@@ -1372,28 +1604,18 @@ gst_v4l2_codec_h264_enc_encode_frame (GstH264Encoder * encoder,
     }
   }
 
-  if (!gst_v4l2_encoder_request_set_done (request, &bytesused, &flags)) {
-    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
-        ("Driver did not ack the request."), (NULL));
-    goto done;
-  }
+  pending = g_new0 (GstV4l2CodecH264EncPending, 1);
+  pending->request = request;
+  pending->frame = frame;
+  pending->keyframe = h264_frame->type == GstH264Keyframe;
+  g_queue_push_tail (&self->pending_frames, pending);
 
-  gst_v4l2_encoder_request_unref (request);
+  ret = GST_FLOW_OK;
+  while (ret == GST_FLOW_OK &&
+      g_queue_get_length (&self->pending_frames) > self->max_pending)
+    ret = gst_v4l2_codec_h264_enc_finish_pending (self);
 
-  resized_buffer = gst_buffer_copy_region (frame->output_buffer,
-      GST_BUFFER_COPY_MEMORY | GST_BUFFER_COPY_DEEP, 0, bytesused);
-  gst_buffer_replace (&frame->output_buffer, resized_buffer);
-  gst_buffer_unref (resized_buffer);
-
-  if (h264_frame->type == GstH264Keyframe) {
-    GST_BUFFER_FLAG_UNSET (frame->output_buffer, GST_BUFFER_FLAG_DELTA_UNIT);
-    GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
-  } else {
-    GST_BUFFER_FLAG_SET (frame->output_buffer, GST_BUFFER_FLAG_DELTA_UNIT);
-    GST_VIDEO_CODEC_FRAME_UNSET_SYNC_POINT (frame);
-  }
-
-  return gst_video_encoder_finish_frame (venc, frame);
+  return ret;
 
 done:
   if (request)
@@ -1461,6 +1683,7 @@ gst_v4l2_codec_h264_enc_subclass_init (GstV4l2CodecH264EncClass * klass,
   encoder_class->set_format =
       GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_enc_set_format);
   encoder_class->flush = GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_enc_flush);
+  encoder_class->finish = GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_enc_finish);
   encoder_class->sink_event =
       GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_enc_sink_event);
   encoder_class->getcaps = GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_enc_getcaps);
