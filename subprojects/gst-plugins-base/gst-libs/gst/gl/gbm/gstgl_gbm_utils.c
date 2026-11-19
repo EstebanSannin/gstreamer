@@ -206,154 +206,6 @@ gst_gl_gbm_format_to_string (guint32 format)
 }
 
 
-int
-gst_gl_gbm_depth_from_format (guint32 format)
-{
-  if (format == GBM_BO_FORMAT_XRGB8888)
-    format = GBM_FORMAT_XRGB8888;
-  if (format == GBM_BO_FORMAT_ARGB8888)
-    format = GBM_FORMAT_ARGB8888;
-
-  switch (format) {
-    case GBM_FORMAT_C8:
-    case GBM_FORMAT_RGB332:
-    case GBM_FORMAT_BGR233:
-      return 8;
-
-    case GBM_FORMAT_NV12:
-    case GBM_FORMAT_XRGB4444:
-    case GBM_FORMAT_XBGR4444:
-    case GBM_FORMAT_RGBX4444:
-    case GBM_FORMAT_BGRX4444:
-      return 12;
-
-    case GBM_FORMAT_XRGB1555:
-    case GBM_FORMAT_XBGR1555:
-    case GBM_FORMAT_RGBX5551:
-    case GBM_FORMAT_BGRX5551:
-      return 15;
-
-    case GBM_FORMAT_ARGB4444:
-    case GBM_FORMAT_ABGR4444:
-    case GBM_FORMAT_RGBA4444:
-    case GBM_FORMAT_BGRA4444:
-    case GBM_FORMAT_ARGB1555:
-    case GBM_FORMAT_ABGR1555:
-    case GBM_FORMAT_RGBA5551:
-    case GBM_FORMAT_BGRA5551:
-    case GBM_FORMAT_RGB565:
-    case GBM_FORMAT_BGR565:
-    case GBM_FORMAT_YUYV:
-    case GBM_FORMAT_YVYU:
-    case GBM_FORMAT_UYVY:
-    case GBM_FORMAT_VYUY:
-      return 16;
-
-    case GBM_FORMAT_RGB888:
-    case GBM_FORMAT_BGR888:
-    case GBM_FORMAT_XRGB8888:
-    case GBM_FORMAT_XBGR8888:
-    case GBM_FORMAT_RGBX8888:
-    case GBM_FORMAT_BGRX8888:
-    case GBM_FORMAT_AYUV:
-      return 24;
-
-    case GBM_FORMAT_XRGB2101010:
-    case GBM_FORMAT_XBGR2101010:
-    case GBM_FORMAT_RGBX1010102:
-    case GBM_FORMAT_BGRX1010102:
-      return 30;
-
-    case GBM_FORMAT_ARGB8888:
-    case GBM_FORMAT_ABGR8888:
-    case GBM_FORMAT_RGBA8888:
-    case GBM_FORMAT_BGRA8888:
-    case GBM_FORMAT_ARGB2101010:
-    case GBM_FORMAT_ABGR2101010:
-    case GBM_FORMAT_RGBA1010102:
-    case GBM_FORMAT_BGRA1010102:
-      return 32;
-
-    default:
-      GST_ERROR ("unknown GBM format %" G_GUINT32_FORMAT, format);
-  }
-
-  return 0;
-}
-
-
-int
-gst_gl_gbm_bpp_from_format (guint32 format)
-{
-  if (format == GBM_BO_FORMAT_XRGB8888)
-    format = GBM_FORMAT_XRGB8888;
-  if (format == GBM_BO_FORMAT_ARGB8888)
-    format = GBM_FORMAT_ARGB8888;
-
-  switch (format) {
-    case GBM_FORMAT_C8:
-    case GBM_FORMAT_RGB332:
-    case GBM_FORMAT_BGR233:
-      return 8;
-
-    case GBM_FORMAT_NV12:
-      return 12;
-
-    case GBM_FORMAT_XRGB4444:
-    case GBM_FORMAT_XBGR4444:
-    case GBM_FORMAT_RGBX4444:
-    case GBM_FORMAT_BGRX4444:
-    case GBM_FORMAT_ARGB4444:
-    case GBM_FORMAT_ABGR4444:
-    case GBM_FORMAT_RGBA4444:
-    case GBM_FORMAT_BGRA4444:
-    case GBM_FORMAT_XRGB1555:
-    case GBM_FORMAT_XBGR1555:
-    case GBM_FORMAT_RGBX5551:
-    case GBM_FORMAT_BGRX5551:
-    case GBM_FORMAT_ARGB1555:
-    case GBM_FORMAT_ABGR1555:
-    case GBM_FORMAT_RGBA5551:
-    case GBM_FORMAT_BGRA5551:
-    case GBM_FORMAT_RGB565:
-    case GBM_FORMAT_BGR565:
-    case GBM_FORMAT_YUYV:
-    case GBM_FORMAT_YVYU:
-    case GBM_FORMAT_UYVY:
-    case GBM_FORMAT_VYUY:
-      return 16;
-
-    case GBM_FORMAT_RGB888:
-    case GBM_FORMAT_BGR888:
-      return 24;
-
-    case GBM_FORMAT_XRGB8888:
-    case GBM_FORMAT_XBGR8888:
-    case GBM_FORMAT_RGBX8888:
-    case GBM_FORMAT_BGRX8888:
-    case GBM_FORMAT_ARGB8888:
-    case GBM_FORMAT_ABGR8888:
-    case GBM_FORMAT_RGBA8888:
-    case GBM_FORMAT_BGRA8888:
-    case GBM_FORMAT_XRGB2101010:
-    case GBM_FORMAT_XBGR2101010:
-    case GBM_FORMAT_RGBX1010102:
-    case GBM_FORMAT_BGRX1010102:
-    case GBM_FORMAT_ARGB2101010:
-    case GBM_FORMAT_ABGR2101010:
-    case GBM_FORMAT_RGBA1010102:
-    case GBM_FORMAT_BGRA1010102:
-    case GBM_FORMAT_AYUV:
-      return 32;
-
-    default:
-      GST_ERROR ("unknown GBM format %" G_GUINT32_FORMAT, format);
-  }
-
-  return 0;
-}
-
-
 static void
 gst_gl_gbm_drm_fb_destroy_callback (struct gbm_bo *bo, void *data)
 {
@@ -372,19 +224,19 @@ gst_gl_gbm_drm_fb_get_from_bo (struct gbm_bo *bo)
 {
   GstGLDRMFramebuffer *fb;
   int drm_fd;
-  guint32 width, height, stride, format, handle;
-  int depth, bpp;
+  guint32 width, height, format;
+  guint32 handles[4] = { 0 }, strides[4] = { 0 }, offsets[4] = { 0 };
   int ret;
 
   /* We want to use this buffer object (abbr. "bo") as a scanout buffer.
-   * To that end, we associate the bo with the DRM by using drmModeAddFB().
+   * To that end, we associate the bo with the DRM by using drmModeAddFB2().
    * However, this needs to be called exactly once for the given bo, and the
    * counterpart, drmModeRmFB(), needs to be called when the bo is cleaned up.
    *
    * To fulfill these requirements, add extra framebuffer information to the
    * bo as "user data". This way, if this user data pointer is NULL, it means
    * that no framebuffer information was generated yet & the bo was not set
-   * as a scanout buffer with drmModeAddFB() yet, and we have perform these
+   * as a scanout buffer with drmModeAddFB2() yet, and we have perform these
    * steps. Otherwise, if it is non-NULL, we know we do not have to set up
    * anything (since it was done already) and just return the pointer to the
    * framebuffer information. */
@@ -405,21 +257,20 @@ gst_gl_gbm_drm_fb_get_from_bo (struct gbm_bo *bo)
 
   width = gbm_bo_get_width (bo);
   height = gbm_bo_get_height (bo);
-  stride = gbm_bo_get_stride (bo);
   format = gbm_bo_get_format (bo);
-  handle = gbm_bo_get_handle (bo).u32;
-
-  depth = gst_gl_gbm_depth_from_format (format);
-  bpp = gst_gl_gbm_bpp_from_format (format);
+  handles[0] = gbm_bo_get_handle (bo).u32;
+  strides[0] = gbm_bo_get_stride (bo);
 
   GST_DEBUG ("Attempting to add GBM BO as scanout framebuffer width/height: %"
       G_GUINT32_FORMAT "/%" G_GUINT32_FORMAT " pixels  stride: %"
-      G_GUINT32_FORMAT " bytes  format: %s  depth: %d bits  total bpp: %d bits",
-      width, height, stride, gst_gl_gbm_format_to_string (format), depth, bpp);
+      G_GUINT32_FORMAT " bytes  format: %s", width, height, strides[0],
+      gst_gl_gbm_format_to_string (format));
 
-  /* Set the bo as a scanout framebuffer */
-  ret = drmModeAddFB (drm_fd, width, height, depth, bpp, stride, handle,
-      &fb->fb_id);
+  /* Set the bo as a scanout framebuffer. drmModeAddFB() only takes a depth
+   * and a bit count, from which the kernel derives an XRGB or ARGB format,
+   * so pass the format of the bo instead. */
+  ret = drmModeAddFB2 (drm_fd, width, height, format, handles, strides,
+      offsets, &fb->fb_id, 0);
   if (ret != 0) {
     GST_ERROR ("Failed to add GBM BO as scanout framebuffer: %s (%d)",
         g_strerror (errno), errno);
@@ -435,12 +286,56 @@ gst_gl_gbm_drm_fb_get_from_bo (struct gbm_bo *bo)
 }
 
 
+typedef enum
+{
+  DRM_DISPLAY_NONE,
+  DRM_DISPLAY_DISCONNECTED,
+  DRM_DISPLAY_CONNECTED,
+} DRMDisplayState;
+
+static DRMDisplayState
+gst_gl_gbm_get_drm_display_state (int drm_fd)
+{
+  DRMDisplayState state = DRM_DISPLAY_NONE;
+  drmModeRes *resources;
+  int i;
+
+  /* Render-only devices have no mode setting resources */
+  resources = drmModeGetResources (drm_fd);
+  if (resources == NULL)
+    return DRM_DISPLAY_NONE;
+
+  for (i = 0; i < resources->count_connectors; ++i) {
+    drmModeConnector *connector =
+        drmModeGetConnector (drm_fd, resources->connectors[i]);
+
+    if (connector == NULL)
+      continue;
+
+    if (connector->connection == DRM_MODE_CONNECTED)
+      state = DRM_DISPLAY_CONNECTED;
+    else if (state == DRM_DISPLAY_NONE)
+      state = DRM_DISPLAY_DISCONNECTED;
+
+    drmModeFreeConnector (connector);
+
+    if (state == DRM_DISPLAY_CONNECTED)
+      break;
+  }
+
+  drmModeFreeResources (resources);
+
+  return state;
+}
+
+
 int
 gst_gl_gbm_find_and_open_drm_node (void)
 {
   /* In here we use GUDev to try to autodetect the GPU */
 
-  int drm_fd = -1;
+  int drm_fd = -1, fd;
+  DRMDisplayState display, best_display = DRM_DISPLAY_NONE;
   GUdevClient *gudev_client = NULL;
   GUdevEnumerator *gudev_enum = NULL;
   GList *devlist = NULL;
@@ -461,10 +356,12 @@ gst_gl_gbm_find_and_open_drm_node (void)
   }
   GST_DEBUG ("Created gudev enumerator");
 
-  /* TODO: To be 100% sure we pick the right device, also check
-   * if this is a GPU, because a pure scanout device could also
-   * have a DRM subsystem for example. However, currently it is
-   * unclear how to do that. By trying to create an EGL context? */
+  /* Prefer a device with a connected display. On many SoCs the GPU is a
+   * render-only DRM device next to the display controller (etnaviv and
+   * the LCDIF on i.MX, for example), and the GPU may come first. Mesa
+   * renders into buffers of the display controller through its kmsro
+   * driver. Without any display, fall back to the first device that can
+   * be opened, so that rendering without a display keeps working. */
   g_udev_enumerator_add_match_subsystem (gudev_enum, "drm");
   devlist = g_udev_enumerator_execute (gudev_enum);
   GST_DEBUG ("Scanned for udev devices with a drm subsystem");
@@ -484,15 +381,30 @@ gst_gl_gbm_find_and_open_drm_node (void)
 
     GST_DEBUG ("Found DRM device with device node \"%s\"", devnode);
 
-    drm_fd = open (devnode, O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) {
+    fd = open (devnode, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
       GST_WARNING ("Cannot open device node \"%s\": %s (%d)", devnode,
           g_strerror (errno), errno);
       continue;
     }
 
-    GST_DEBUG ("Device node \"%s\" is a valid DRM device node", devnode);
-    break;
+    display = gst_gl_gbm_get_drm_display_state (fd);
+    GST_DEBUG ("Device node \"%s\" is a valid DRM device node (%s)", devnode,
+        display == DRM_DISPLAY_CONNECTED ? "display connected" :
+        display == DRM_DISPLAY_DISCONNECTED ? "no display connected" :
+        "no display connectors");
+
+    if (drm_fd < 0 || display > best_display) {
+      if (drm_fd >= 0)
+        close (drm_fd);
+      drm_fd = fd;
+      best_display = display;
+    } else {
+      close (fd);
+    }
+
+    if (best_display == DRM_DISPLAY_CONNECTED)
+      break;
   }
 
 

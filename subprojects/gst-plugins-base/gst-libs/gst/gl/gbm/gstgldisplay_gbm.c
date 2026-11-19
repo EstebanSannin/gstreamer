@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <string.h>
 
 GST_DEBUG_CATEGORY (gst_gl_gbm_debug);
 
@@ -137,6 +138,149 @@ gst_gl_gbm_find_crtc_id_for_connector (GstGLDisplayGBM * display_gbm)
 
   /* No match found */
   return INVALID_CRTC;
+}
+
+
+static gboolean
+gst_gl_display_gbm_plane_is_primary (GstGLDisplayGBM * display_gbm,
+    guint32 plane_id)
+{
+  drmModeObjectProperties *props;
+  gboolean is_primary = FALSE;
+  guint32 i;
+
+  props = drmModeObjectGetProperties (display_gbm->drm_fd, plane_id,
+      DRM_MODE_OBJECT_PLANE);
+  if (props == NULL)
+    return FALSE;
+
+  for (i = 0; i < props->count_props; ++i) {
+    drmModePropertyRes *prop =
+        drmModeGetProperty (display_gbm->drm_fd, props->props[i]);
+
+    if (prop != NULL && g_strcmp0 (prop->name, "type") == 0)
+      is_primary = (props->prop_values[i] == DRM_PLANE_TYPE_PRIMARY);
+
+    drmModeFreeProperty (prop);
+  }
+
+  drmModeFreeObjectProperties (props);
+
+  return is_primary;
+}
+
+
+/* Find the formats of the primary plane of the selected CRTC. Frames are
+ * shown on that plane, which often supports fewer formats than EGL can
+ * render to: no 10-bit or alpha formats, for example. */
+static void
+gst_gl_display_gbm_find_plane_formats (GstGLDisplayGBM * display_gbm)
+{
+  drmModePlaneRes *plane_resources;
+  guint32 i, j;
+
+  /* Primary planes are only listed with universal planes enabled */
+  if (drmSetClientCap (display_gbm->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+          1) != 0) {
+    GST_DEBUG ("Universal planes are not supported; not checking the formats "
+        "of the primary plane");
+    return;
+  }
+
+  plane_resources = drmModeGetPlaneResources (display_gbm->drm_fd);
+  if (plane_resources == NULL) {
+    GST_WARNING ("Could not get DRM plane resources: %s (%d)",
+        g_strerror (errno), errno);
+    return;
+  }
+
+  for (i = 0; i < plane_resources->count_planes; ++i) {
+    drmModePlane *plane = drmModeGetPlane (display_gbm->drm_fd,
+        plane_resources->planes[i]);
+
+    if (plane == NULL)
+      continue;
+
+    if ((plane->possible_crtcs & (1u << display_gbm->crtc_index))
+        && gst_gl_display_gbm_plane_is_primary (display_gbm, plane->plane_id)) {
+      display_gbm->plane_formats = g_new (guint32, plane->count_formats);
+      memcpy (display_gbm->plane_formats, plane->formats,
+          plane->count_formats * sizeof (guint32));
+      display_gbm->n_plane_formats = plane->count_formats;
+
+      GST_DEBUG ("Primary plane %" G_GUINT32_FORMAT " supports %"
+          G_GUINT32_FORMAT " format(s)", plane->plane_id, plane->count_formats);
+      for (j = 0; j < plane->count_formats; ++j)
+        GST_DEBUG ("  %" GST_FOURCC_FORMAT,
+            GST_FOURCC_ARGS (plane->formats[j]));
+    }
+
+    drmModeFreePlane (plane);
+
+    if (display_gbm->plane_formats != NULL)
+      break;
+  }
+
+  drmModeFreePlaneResources (plane_resources);
+
+  if (display_gbm->plane_formats == NULL)
+    GST_WARNING ("No primary plane found for CRTC %" G_GUINT32_FORMAT,
+        display_gbm->crtc_id);
+}
+
+
+static gboolean
+gst_gl_display_gbm_plane_has_format (GstGLDisplayGBM * display_gbm,
+    guint32 format)
+{
+  guint i;
+
+  for (i = 0; i < display_gbm->n_plane_formats; ++i) {
+    if (display_gbm->plane_formats[i] == format)
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
+
+/* Returns the GBM format to create a GBM surface with, when rendering with
+ * an EGLConfig of the given format (its native visual ID), such that the
+ * primary plane can show its buffers: the format itself, or the format
+ * without alpha. 0 if the primary plane supports neither. The format itself
+ * if the formats of the primary plane are unknown. */
+guint32
+gst_gl_display_gbm_get_scanout_format (GstGLDisplayGBM * display_gbm,
+    guint32 format)
+{
+  /* Formats with alpha and their counterpart without. Mesa allows rendering
+   * into a GBM surface without alpha with an EGLConfig that has alpha. */
+  static const guint32 opaque_formats[][2] = {
+    {GBM_FORMAT_ARGB8888, GBM_FORMAT_XRGB8888},
+    {GBM_FORMAT_ABGR8888, GBM_FORMAT_XBGR8888},
+    {GBM_FORMAT_RGBA8888, GBM_FORMAT_RGBX8888},
+    {GBM_FORMAT_BGRA8888, GBM_FORMAT_BGRX8888},
+    {GBM_FORMAT_ARGB2101010, GBM_FORMAT_XRGB2101010},
+    {GBM_FORMAT_ABGR2101010, GBM_FORMAT_XBGR2101010},
+    {GBM_FORMAT_RGBA1010102, GBM_FORMAT_RGBX1010102},
+    {GBM_FORMAT_BGRA1010102, GBM_FORMAT_BGRX1010102},
+  };
+  guint i;
+
+  if (display_gbm->plane_formats == NULL)
+    return format;
+
+  if (gst_gl_display_gbm_plane_has_format (display_gbm, format))
+    return format;
+
+  for (i = 0; i < G_N_ELEMENTS (opaque_formats); ++i) {
+    if (opaque_formats[i][0] == format
+        && gst_gl_display_gbm_plane_has_format (display_gbm,
+            opaque_formats[i][1]))
+      return opaque_formats[i][1];
+  }
+
+  return 0;
 }
 
 
@@ -340,6 +484,8 @@ gst_gl_display_gbm_setup_drm (GstGLDisplayGBM * display_gbm, const gchar *
         display_gbm->crtc_index);
   }
 
+  gst_gl_display_gbm_find_plane_formats (display_gbm);
+
   GST_DEBUG ("DRM structures initialized");
   return TRUE;
 
@@ -358,6 +504,9 @@ gst_gl_display_gbm_shutdown_drm (GstGLDisplayGBM * display_gbm)
 
   display_gbm->crtc_index = -1;
   display_gbm->crtc_id = INVALID_CRTC;
+
+  g_clear_pointer (&display_gbm->plane_formats, g_free);
+  display_gbm->n_plane_formats = 0;
 
   if (display_gbm->drm_mode_connector != NULL) {
     drmModeFreeConnector (display_gbm->drm_mode_connector);

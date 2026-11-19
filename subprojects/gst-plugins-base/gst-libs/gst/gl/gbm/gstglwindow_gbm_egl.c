@@ -220,6 +220,15 @@ draw_cb (gpointer data)
         gbm_surface_lock_front_buffer (window_egl->gbm_surf);
     framebuf = gst_gl_gbm_drm_fb_get_from_bo (window_egl->current_bo);
 
+    if (framebuf == NULL) {
+      GST_ERROR ("Could not get a DRM framebuffer for the first frame");
+      gbm_surface_release_buffer (window_egl->gbm_surf, window_egl->current_bo);
+      window_egl->current_bo = NULL;
+      gst_object_unref (context);
+      /* XXX: it is not possible to communicate the error to the pipeline */
+      return;
+    }
+
     /* Save the CRTC state */
     if (!window_egl->saved_crtc)
       window_egl->saved_crtc =
@@ -257,6 +266,12 @@ draw_cb (gpointer data)
 
   next_bo = gbm_surface_lock_front_buffer (window_egl->gbm_surf);
   framebuf = gst_gl_gbm_drm_fb_get_from_bo (next_bo);
+  if (framebuf == NULL) {
+    GST_ERROR ("Could not get a DRM framebuffer for bo %p", (gpointer) next_bo);
+    gbm_surface_release_buffer (window_egl->gbm_surf, next_bo);
+    /* XXX: it is not possible to communicate the error to the pipeline */
+    return;
+  }
   GST_LOG ("rendered new frame into bo %p", (gpointer) next_bo);
 
   /* Wait until any ongoing page flipping is done. After this is done,
@@ -339,6 +354,7 @@ gst_gl_window_gbm_init_surface (GstGLWindowGBMEGL * window_egl)
   GstGLContext *context = gst_gl_window_get_context (window);
   GstGLContextEGL *context_egl = GST_GL_CONTEXT_EGL (context);
   EGLint gbm_format;
+  guint32 scanout_format;
   int hdisplay, vdisplay;
   gboolean ret = TRUE;
 
@@ -358,6 +374,15 @@ gst_gl_window_gbm_init_surface (GstGLWindowGBMEGL * window_egl)
         gst_egl_get_error_string (eglGetError ()));
     ret = FALSE;
     goto cleanup;
+  }
+
+  /* The display may only show the format of the EGLConfig without alpha */
+  scanout_format = gst_gl_display_gbm_get_scanout_format (display, gbm_format);
+  if (scanout_format != 0 && scanout_format != (guint32) gbm_format) {
+    GST_DEBUG ("Using GBM format %s for an EGLConfig with format %s",
+        gst_gl_gbm_format_to_string (scanout_format),
+        gst_gl_gbm_format_to_string (gbm_format));
+    gbm_format = scanout_format;
   }
 
   /* Create a GBM surface that shall contain the BOs we are
