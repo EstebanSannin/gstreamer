@@ -369,6 +369,14 @@ gst_gl_upload_element_fixate_caps (GstBaseTransform * bt,
     GstPadDirection direction, GstCaps * caps, GstCaps * othercaps)
 {
   GstGLUploadElement *upload = GST_GL_UPLOAD_ELEMENT (bt);
+  GstGLContext *context;
+
+  /* Fixation depends on what the context can import */
+  context = gst_gl_base_filter_get_gl_context (GST_GL_BASE_FILTER (bt));
+  if (context) {
+    gst_gl_upload_set_context (upload->upload, context);
+    gst_object_unref (context);
+  }
 
   return gst_gl_upload_fixate_caps (upload->upload, direction, caps, othercaps);
 }

@@ -1040,6 +1040,31 @@ _remove_field (GstCaps * caps, const gchar * field)
   }
 }
 
+/* External textures cannot be read back, and elements that are not GL aware
+ * cannot use them either, so only accept 2D and rectangle textures. Takes
+ * ownership of @caps. */
+static GstCaps *
+_restrict_to_readable_targets (GstCaps * caps)
+{
+  GstCaps *targets, *ret;
+  GValue value = G_VALUE_INIT;
+
+  targets = gst_caps_new_empty_simple ("video/x-raw");
+  gst_caps_set_features_simple (targets,
+      gst_caps_features_new_single_static_str
+      (GST_CAPS_FEATURE_MEMORY_GL_MEMORY));
+  gst_gl_value_set_texture_target_from_mask (&value,
+      (1 << GST_GL_TEXTURE_TARGET_2D) | (1 << GST_GL_TEXTURE_TARGET_RECTANGLE));
+  gst_caps_set_value (targets, "texture-target", &value);
+  g_value_unset (&value);
+
+  ret = gst_caps_intersect_full (caps, targets, GST_CAPS_INTERSECT_FIRST);
+  gst_caps_unref (targets);
+  gst_caps_unref (caps);
+
+  return ret;
+}
+
 static GstCaps *
 gst_gl_download_element_transform_caps (GstBaseTransform * bt,
     GstPadDirection direction, GstCaps * caps, GstCaps * filter)
@@ -1060,6 +1085,7 @@ gst_gl_download_element_transform_caps (GstBaseTransform * bt,
 
     tmp = _set_caps_features (context, sys_caps,
         GST_CAPS_FEATURE_MEMORY_GL_MEMORY);
+    tmp = _restrict_to_readable_targets (tmp);
     tmp = gst_caps_merge (tmp, sys_caps);
   } else {
     GstCaps *newcaps;
